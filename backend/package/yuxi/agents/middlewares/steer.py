@@ -12,13 +12,14 @@ class SteerMiddleware(AgentMiddleware):
     """
 
     @hook_config(can_jump_to=["end"])
-    async def abefore_model(self, state, runtime):  # noqa: ARG002
-        guided_update = await self._collect_guided_update(runtime)
+    async def abefore_model(self, state, runtime):
+        # 先判定让位：steer 命中时不消费 guided——take_pending_guided_messages 会把请求
+        # 提交为 injected 终态，而让位会立刻结束本 Run、消息不会进入 checkpoint，
+        # 结果是"既不在队列、也不在图里"的永久丢失。留在队列由下一个 Run 注入。
         steer_jump = await self._jump_if_steer_requested(runtime)
         if steer_jump is not None:
-            # 让位时 guided 消息已标记注入并随 checkpoint 留给下一个 Run。
             return steer_jump
-        return guided_update
+        return await self._collect_guided_update(state, runtime)
 
     @hook_config(can_jump_to=["end"])
     async def aafter_model(self, state, runtime):
@@ -27,14 +28,17 @@ class SteerMiddleware(AgentMiddleware):
             return None
         return await self._jump_if_steer_requested(runtime)
 
-    async def _collect_guided_update(self, runtime):
+    async def _collect_guided_update(self, state, runtime):
         from yuxi.services.agent_request_queue_service import take_pending_guided_messages
 
         run_id = getattr(runtime.context, "run_id", None)
         if not run_id:
             return None
         try:
-            messages = await take_pending_guided_messages(run_id)
+            messages = await take_pending_guided_messages(
+                run_id,
+                applied_message_ids=_state_message_ids(state),
+            )
         except Exception:  # noqa: BLE001
             return None
         if not messages:
@@ -48,6 +52,17 @@ class SteerMiddleware(AgentMiddleware):
         if not run_id or not await should_end_run_for_steer(run_id):
             return None
         return {"jump_to": "end"}
+
+
+def _state_message_ids(state) -> set[str]:
+    """取出当前 graph state 里的消息 id，作为 guided 注入"是否已生效"的判据。"""
+    messages = state.get("messages") if isinstance(state, dict) else None
+    ids: set[str] = set()
+    for message in messages or []:
+        message_id = message.get("id") if isinstance(message, dict) else getattr(message, "id", None)
+        if message_id:
+            ids.add(str(message_id))
+    return ids
 
 
 def _last_message_has_tool_calls(state) -> bool:

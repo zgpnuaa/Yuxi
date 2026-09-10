@@ -417,13 +417,38 @@ async def should_end_run_for_steer(run_id: str) -> bool:
         return request is not None
 
 
-async def take_pending_guided_messages(run_id: str) -> list:
+def is_guided_request_applied(
+    request_status: str,
+    raw_message_id: str | None,
+    applied_message_ids: set[str],
+) -> bool:
+    """判断一条已 injected 的 guided 请求是否真正进入了 checkpoint。
+
+    injected 只表示"已提交注入"，提交早于 checkpoint 落盘。以 state 中的消息 id 作为
+    已生效判据：命中的请求跳过，其余（含崩溃后未落盘、以及仍处 queued 的）继续注入。
+    """
+    if request_status != REQUEST_STATUS_INJECTED:
+        return False
+    return bool(raw_message_id) and raw_message_id in applied_message_ids
+
+
+async def take_pending_guided_messages(
+    run_id: str,
+    *,
+    applied_message_ids: set[str] | None = None,
+) -> list:
     """收割并标记属于当前 Run 的 guided 消息，返回可注入 state 的 HumanMessage 列表。
 
     仅在模型调用前（middleware before_model）调用；run 由 worker lease 保证单写者，
     读取-标记在同一事务内完成。消息从 Message.extra_metadata.raw_message 恢复，
     保留原始 LangChain id，使 run 结束保存时与既有 Message 行按 id 去重。
+
+    applied_message_ids 是当前 graph state 里已有的消息 id 集合。injected 只代表
+    "已提交注入"，而该提交早于 checkpoint 落盘——worker 若在两者之间退出，仅凭状态
+    无法恢复。这里以 checkpoint 作为"已生效"的权威判据：已 injected 但不在 state 中的
+    请求会被重新注入（幂等重放），在 state 中的则跳过，保证恰好收到一次。
     """
+    applied = applied_message_ids or set()
     from langchain.messages import HumanMessage
 
     injected: list = []
@@ -437,6 +462,7 @@ async def take_pending_guided_messages(run_id: str) -> list:
             uid=run.uid,
             agent_slug=run.agent_slug,
             conversation_thread_id=run.conversation_thread_id,
+            statuses=("queued", "injected"),
         )
         for request in requests:
             message = (
@@ -448,6 +474,10 @@ async def take_pending_guided_messages(run_id: str) -> list:
             raw = (
                 (message.extra_metadata or {}).get("raw_message") if isinstance(message.extra_metadata, dict) else None
             )
+            # 已注入且已出现在 checkpoint 中：确认生效，跳过（不重复注入）。
+            raw_id = str(raw.get("id")) if isinstance(raw, dict) and raw.get("id") else None
+            if is_guided_request_applied(request.status, raw_id, applied):
+                continue
             if isinstance(raw, dict):
                 try:
                     injected.append(HumanMessage(**{k: v for k, v in raw.items() if k in ("content", "id", "name")}))

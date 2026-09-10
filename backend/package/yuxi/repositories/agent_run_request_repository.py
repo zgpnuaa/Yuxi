@@ -115,8 +115,13 @@ class AgentRunRequestRepository:
         uid: str,
         agent_slug: str,
         conversation_thread_id: str,
+        statuses: tuple[str, ...] = ("queued",),
     ) -> list[AgentRunRequest]:
-        """读取线程内待注入的 guided 请求（FIFO，允许多条同时等待）。"""
+        """读取线程内待注入的 guided 请求（FIFO，允许多条同时等待）。
+
+        statuses 默认只含 queued；调用方需要在崩溃后重放时会一并传入 injected——
+        injected 只表示"已提交注入"，是否真正进入 checkpoint 由调用方以 state 判定。
+        """
         result = await self.db.execute(
             select(AgentRunRequest)
             .where(
@@ -124,7 +129,7 @@ class AgentRunRequestRepository:
                 AgentRunRequest.agent_slug == agent_slug,
                 AgentRunRequest.conversation_thread_id == conversation_thread_id,
                 AgentRunRequest.queue_policy == "guided",
-                AgentRunRequest.status == "queued",
+                AgentRunRequest.status.in_(statuses),
             )
             .order_by(AgentRunRequest.created_at.asc(), AgentRunRequest.id.asc())
         )

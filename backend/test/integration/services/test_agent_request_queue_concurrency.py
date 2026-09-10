@@ -13,12 +13,9 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
-from yuxi.services import agent_request_queue_service
-from yuxi.services import context_compression_service
-from yuxi.services import run_worker
+from yuxi.repositories.agent_run_request_repository import AgentRunRequestRepository
+from yuxi.services import agent_request_queue_service, context_compression_service, run_worker
 from yuxi.services.input_message_service import build_chat_input_message
 from yuxi.storage.postgres.models_business import (
     AgentRun,
@@ -863,3 +860,77 @@ async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict
             await db.execute(delete(User).where(User.uid == uid))
             await db.commit()
         await engine.dispose()
+
+
+async def test_guided_injected_request_remains_replayable_until_checkpoint_confirms(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """提交 injected 后崩溃（消息未进 checkpoint）：恢复时仍能被重新捞取注入。
+
+    `take_pending_guided_messages` 在把消息交给 middleware **之前**就提交 injected 终态，
+    而 checkpoint 尚未落盘。worker 若在这两步之间退出，只捞 queued 的实现会让消息
+    永久丢失（既不注入也不派发）。本用例在真实 PostgreSQL 上验证恢复路径：
+    默认调用看不到 injected 请求（复现丢失），带 `statuses=("queued","injected")`
+    的恢复调用能看到它。
+    """
+    thread_id = f"pytest-guided-{uuid.uuid4()}"
+    uid = f"pytest-user-{uuid.uuid4()}"
+    request_id = f"guided-{uuid.uuid4()}"
+    engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        async with session_factory() as db:
+            conversation = await _queue_test_conversation(db, thread_id=thread_id, uid=uid)
+            db.add(conversation)
+            await db.flush()
+            message = Message(
+                conversation_id=conversation.id,
+                role="user",
+                content="补充：只看 2024 年后的数据",
+                request_id=request_id,
+                delivery_status="queued",
+            )
+            db.add(message)
+            await db.flush()
+            # 直接落一条等待注入的 guided 请求（等价于运行中提交、排在活跃 Run 之后）。
+            db.add(
+                AgentRunRequest(
+                    request_id=request_id,
+                    uid=uid,
+                    agent_slug="main",
+                    conversation_thread_id=thread_id,
+                    source="chat",
+                    queue_policy="guided",
+                    status="queued",
+                    input_message_id=message.id,
+                    input_payload={},
+                )
+            )
+            await db.commit()
+
+        # 模拟 take_pending_guided_messages 提交 injected 之后、checkpoint 落盘之前崩溃。
+        async with session_factory() as db:
+            assert await AgentRunRequestRepository(db).mark_guided_injected([request_id]) == 1
+            await db.commit()
+
+        async with session_factory() as db:
+            repo = AgentRunRequestRepository(db)
+            # 只读 queued：崩溃后这条消息再也捞不到——正是原实现的丢失路径。
+            queued_only = await repo.list_pending_guided(
+                uid=uid,
+                agent_slug="main",
+                conversation_thread_id=thread_id,
+            )
+            assert [item.request_id for item in queued_only] == []
+
+            # 恢复路径：一并读取 injected，交由 state 判定是否已生效。
+            replayable = await repo.list_pending_guided(
+                uid=uid,
+                agent_slug="main",
+                conversation_thread_id=thread_id,
+                statuses=("queued", "injected"),
+            )
+            assert [item.request_id for item in replayable] == [request_id]
+    finally:
+        await _cleanup_queue_test_thread(session_factory, engine, thread_id)
