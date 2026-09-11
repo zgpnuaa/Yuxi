@@ -165,10 +165,42 @@ def _create_tavily_search():
     return TavilySearch(name="web_search")
 
 
+INTERNAL_SEARCH_DESCRIPTION = """执行内部网络搜索，检索企业内网知识库、文档与内部站点内容。
+
+适用场景：
+1. 检索内网文档、规章制度、知识库
+2. 查找内部站点/系统的资料
+
+注意：当前为占位实现，内部搜索引擎后端待定（Meilisearch / 企业搜索）。
+"""
+
+
+class InternalSearchInput(BaseModel):
+    query: str = Field(description="搜索查询词，精准描述检索需求")
+    count: int = Field(default=10, ge=1, le=50, description="返回搜索结果数量，默认 10 条")
+
+
+@langchain_tool("web_search", args_schema=InternalSearchInput, description=INTERNAL_SEARCH_DESCRIPTION)
+def _internal_search(query: str, count: int = 10) -> dict:
+    """内部搜索占位：后端未定，返回明确的未接入提示，不崩溃。"""
+    del count  # 占位实现暂不用 count；后端定了再实现真实检索
+    url = os.getenv("INTERNAL_SEARCH_URL", "").strip()
+    if not url:
+        return {"query": query, "results": [], "error": "内部搜索引擎未接入（INTERNAL_SEARCH_URL 未配置）"}
+    # TODO: 后端定了（Meilisearch / 企业搜索）后在此实现真实检索
+    return {"query": query, "results": [], "error": f"内部搜索引擎已配置（{url}），但检索实现待接入"}
+
+
+def _create_internal_search():
+    """Create the internal search tool instance (placeholder until backend is chosen)."""
+    return _internal_search
+
+
 # provider -> (required env var, factory, display name)
 _WEB_SEARCH_PROVIDERS = {
     "doubao": ("DOUBAO_SEARCH_API_KEY", _create_doubao_search, "豆包 网页搜索"),
     "tavily": ("TAVILY_API_KEY", _create_tavily_search, "Tavily 网页搜索"),
+    "internal": ("INTERNAL_SEARCH_API_KEY", _create_internal_search, "内部搜索"),
 }
 
 
